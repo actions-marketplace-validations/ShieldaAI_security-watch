@@ -129,6 +129,7 @@ export const configSchema = z
           .max(3)
           .refine((values) => new Set(values).size === values.length, 'Duplicate vendor feed')
           .default([]),
+        epss: z.boolean().default(false),
       })
       .strict()
       .default({
@@ -140,6 +141,7 @@ export const configSchema = z
         kev: false,
         feeds: [],
         vendor_feeds: [],
+        epss: false,
       }),
     models: z
       .object({
@@ -172,6 +174,7 @@ export const configSchema = z
         malware_override: z.boolean().default(true),
         ai_dismissals: z.enum(['review', 'record']).optional(),
         review_before_news_suppression: z.boolean().optional(),
+        news_signals: z.boolean().default(true),
         health_channels: channels.default([]),
       })
       .strict()
@@ -183,6 +186,7 @@ export const configSchema = z
         exploited_override: true,
         malware_override: true,
         ai_dismissals: 'review',
+        news_signals: true,
         health_channels: [],
       })
       .superRefine((policy, ctx) => {
@@ -267,7 +271,11 @@ export const configSchema = z
             path: ['tls_cert_file'],
           });
         const host = intake.listen.slice(0, intake.listen.lastIndexOf(':')).replace(/^\[|\]$/g, '');
-        const loopback = host === 'localhost' || host === '::1' || /^127\./.test(host);
+        // An address, not a name that starts like one: `127.example.com` can point anywhere.
+        const loopback =
+          host.toLowerCase() === 'localhost' ||
+          (isIP(host) === 4 && host.startsWith('127.')) ||
+          (isIP(host) === 6 && /^(?:0*:)*:?0*1$/.test(host));
         if (!loopback && !intake.tls_cert_file && !intake.allow_plain_http)
           ctx.addIssue({
             code: 'custom',

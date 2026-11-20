@@ -2,6 +2,37 @@
 
 Versions follow [semantic versioning](https://semver.org/). What counts as a compatible change is defined in the [compatibility policy](docs/compatibility.md).
 
+## 1.2.0
+
+News that no advisory has scored yet gets a level from what the articles say, and findings can show EPSS. Existing configurations and inventories work unchanged. To be published under the default `latest` tag; the GitHub Action is used as `uses: ShieldaAI/security-watch@v1.2.0`.
+
+### Added
+
+- **News signals.** For a news finding with no advisory severity (a zero-day without a CVE, a CVE that is reserved but not published, a vendor bulletin), the articles are read, without a model, for a CVSS score, a vendor's word rating, a report of exploitation, a denial of exploitation and public exploit code. A score or rating raises the finding's priority to at least its level; a report of exploitation raises it to critical, so with `urgent_unknown` (the default) the finding is sent at once as possibly critical. A statement counts only when it is tied to the finding's subject (its CVE or GHSA identifier, or the product or package it matched); negated and hedged statements and "zero-day" alone are not reports. Signals never lower, dismiss or mark a finding as known exploited, and stop being read once an advisory with a severity joins the finding. Alerts and digests have a `News signals:` line with the score, rating and subject only; `explain` shows the sentences they were read from. See [news signals](docs/configuration.md#news-signals).
+- `policy.news_signals` (default `true`) turns news signals off.
+- **EPSS, optional.** `sources.epss: true` looks up FIRST's EPSS for the CVEs of each current finding (including the CVE aliases of a GHSA-keyed library finding) and shows the highest, with its CVE, in alerts, digests, `explain`, `findings` and the scan report (`Assessment.epss`, exported type `EpssScore`). Only CVE identifiers are sent to `api.first.org`, in batches of 50, at most ten requests a scan, each score refreshed once a day. It is shown only: it changes no priority or decision, and a new daily score creates no finding revision, reopens no review and asks no model for a new analysis. A failed lookup is a notice, and findings keep the last score. See [EPSS](docs/configuration.md#epss).
+- `Assessment.news_signals` and the exported types `NewsSignals` and `NewsStatement`.
+- The configuration guide lists feeds that carry full articles with scores or exploitation reports (Rapid7, Tenable, The Register, Security Affairs, the Zero Day Initiative) and those that carry only headlines.
+
+### Changed
+
+- **Louder for unscored news.** A news finding that an article reports as exploited, or that an article scores at 9.0 or above, now alerts at once where 1.1 put it in the digest. Measured on one week of real articles against a 20-product inventory: five findings were raised and one more immediate alert was sent (an actively exploited ScreenConnect plugin). The first scan after the upgrade reassesses news findings still in the news window, so a raised one is sent once.
+
+### Not verified
+
+- Measured on 256 articles from one week of November 2026, labelled by the developer, not by an independent reviewer. The human-labelled pilot and a real Slack and email delivery remain open, as in 1.0.
+
+## 1.1.1
+
+Fixes for feeds that were read wrongly and for two checks that trusted a name. No configuration change. To be published under the default `latest` tag; the GitHub Action is used as `uses: ShieldaAI/security-watch@v1.1.1`.
+
+### Fixed
+
+- **Feeds with an image in `<media:content>` were read without their text.** The article in `<description>` was ignored whenever an item also had a `<media:content>` element, so every item from feeds such as Rapid7's blog and Dark Reading arrived with an empty description and could match only by its title. The first of `content:encoded`, `content`, `description` and `summary` that holds text is now used. An empty `content:encoded` also falls through to the description.
+- **Feeds that escape their HTML with entities showed the tags as text.** A description written as `&lt;p&gt;` (Tenable's blog, the seclists.org lists) arrived as the literal text `<p>`, `<br>` and similar, which reached matching, models and alerts. A field that carries HTML (RSS `description` and `content:encoded`, Atom `content` and `summary` with `type="html"`) and holds no raw `<`, which escaped XML text never does, is now unescaped once as XML (the five predefined entities and character references only; DTDs are still refused) before it is read as HTML. CDATA and plain-text fields (titles, Atom text content) are read as before, so `&lt;script&gt;` in a title stays text. The first scan after the upgrade records a new revision of items from such feeds that are still in the news window.
+- **A name that starts like a loopback address no longer counts as one.** `intake.listen: 127.example.com:8787` was accepted without TLS or `allow_plain_http`, because the check read the text of the host. Only `localhost`, an IPv4 address in 127.0.0.0/8 and the IPv6 loopback address count now.
+- **`sbom --project FILE` refuses a symbolic link.** A link named like a dependency file was followed to whatever it pointed at, unlike files found inside a project folder, which were already skipped. A project folder given as a link is still read.
+
 ## 1.1.0
 
 Start from your code instead of a hand-written inventory, and keep the inventory current from CI. Existing configurations and inventories work unchanged. To be published under the default `latest` tag. The GitHub Action is used as `uses: ShieldaAI/security-watch@v1.1.0`.
