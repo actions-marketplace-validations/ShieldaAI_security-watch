@@ -41,7 +41,7 @@ Then add the Slack address and start, as in the [README](../README.md#get-starte
 
 The whole folder is searched, up to 12 levels deep. Folders that hold installed or generated copies (`node_modules`, `vendor`, `.venv`, `target`, `dist`, `build` and similar), test data (`fixtures`, `testdata`) and hidden folders are skipped. Symbolic links are not followed.
 
-Where a lockfile and a manifest of the same ecosystem sit in one folder, only the lockfile is read. A manifest below a folder with a lockfile (a workspace member) adds only packages the lockfile does not already have. A package that is known only by name is watched by name: Security Watch can find advisories for it, but cannot say whether your version is affected. Commit lockfiles for exact versions.
+Where a lockfile and a manifest of the same ecosystem sit in one folder, only the lockfile is read. A manifest below a folder with a lockfile (a workspace member) adds only packages the lockfile does not already have, as does a `pyproject.toml` beside `requirements*.txt` files, which often list only some packages. A package that is known only by name is watched by name: Security Watch can find advisories for it, but cannot say whether your version is affected. Commit lockfiles for exact versions.
 
 Development-only dependencies are included and marked `scope: optional`, because a malicious build tool reaches your pipeline even if it never ships. Add `--production` to leave them out where the file says which they are: `package-lock.json`, `package.json`, `pnpm-lock.yaml` 5 and 6, `poetry.lock` (older `category = "dev"`), Poetry dev groups and PEP 735 dependency groups in `pyproject.toml`, `Pipfile.lock`, `composer.lock`, `composer.json`, `pubspec.lock`, `pubspec.yaml`, Maven `test` scope and Gradle test configurations.
 
@@ -127,7 +127,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - id: sbom
-        uses: ShieldaAI/security-watch@v1.2.0
+        uses: ShieldaAI/security-watch@v1.2.1
         with:
           system-id: checkout-api
           owner: Dana, platform team
@@ -143,7 +143,7 @@ To use an SBOM made by another tool, pass it as `sbom-file`; the action checks t
 
 ```yaml
 - run: trivy image --format cyclonedx --output image.cdx.json "$IMAGE"
-- uses: ShieldaAI/security-watch@v1.2.0
+- uses: ShieldaAI/security-watch@v1.2.1
   with:
     sbom-file: image.cdx.json
     system-id: checkout-image
@@ -160,7 +160,7 @@ Any job with Node.js 24.10 or newer can run the command:
 security-watch-sbom:
   image: node:24-slim
   script:
-    - npx --yes @shieldaai/security-watch@1.2.0 sbom --system-id checkout-api --output security-watch.cdx.json --upload https://watch.example.com:8787
+    - npx --yes @shieldaai/security-watch@1.2.1 sbom --system-id checkout-api --output security-watch.cdx.json --upload https://watch.example.com:8787
   artifacts:
     paths: [security-watch.cdx.json]
 ```
