@@ -14,6 +14,7 @@ import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AiReview, Assessment, Config, Decision, Evidence, Notification } from './types.js';
 import { hash, canonicalHash } from './util.js';
+import { evidenceContent } from './shield-inputs.js';
 import { decide } from './assessment.js';
 import {
   aggregatePilotReport,
@@ -38,6 +39,11 @@ function verifyFile(path: string): void {
   // Closing any descriptor for a live SQLite inode releases this process's POSIX locks.
   // Inspect existing files without opening them, including when another Store is already open.
   const stat = lstatSync(path);
+  // SQLite deletes the -wal and -shm files when the last connection to a database closes. A file
+  // that another process is deleting can still be found with no links left (macOS reports this);
+  // it is gone, not a hard link.
+  if (stat.nlink === 0)
+    throw Object.assign(new Error(`${path} was removed while it was being checked`), { code: 'ENOENT' });
   if (!stat.isFile() || stat.nlink !== 1)
     throw new Error('Database paths must be regular files without symbolic or hard links');
   if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0)
@@ -85,8 +91,8 @@ function notification(row: Row): Notification {
   };
 }
 function evidenceFingerprint(evidence: Evidence): string {
-  const { fetched_at: _fetched, ...content } = evidence;
-  return hash(content);
+  // Links, fix commits, weaknesses and exploit-code entries are shield inputs, not a new revision.
+  return hash(evidenceContent(evidence));
 }
 function fingerprint(a: Assessment, decision: Decision): string {
   // Article wording, source arrival order and AI phrasing are not new security events.
@@ -442,8 +448,15 @@ export class Store {
         : [];
       // Where the finding lives (inventory names and notes) is shown to the reader; it is not part
       // of the conclusion a reviewer approves, so editing a note does not ask for a new review.
-      // EPSS changes daily and is shown only: it is not part of the conclusion either.
-      const { updated_at: _updated, location: _location, epss: _epss, ...reviewedAssessment } = assessment;
+      // EPSS changes daily and mitigation status with every export; both are shown only and are
+      // not part of the conclusion either.
+      const {
+        updated_at: _updated,
+        location: _location,
+        epss: _epss,
+        mitigations: _mitigations,
+        ...reviewedAssessment
+      } = assessment;
       // Ordinary alert deduplication stays semantic. A human review instead binds the exact
       // supplied conclusion, source content and host inventory/model context, excluding scan time.
       const signature = decision.review

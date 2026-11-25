@@ -267,6 +267,25 @@ For an existing installation, configuration fields set to `true` stay enabled. T
 
 References: [cve.now machine-readable API guide](https://cve.now/llms.txt), [The Hacker News](https://thehackernews.com/), [OSV batch queries](https://google.github.io/osv.dev/post-v1-querybatch/), [GitHub global advisory API](https://docs.github.com/en/rest/security-advisories/global-advisories), [CISA KEV data](https://github.com/cisagov/kev-data).
 
+## Temporary mitigations
+
+Advisories from OSV and GitHub keep their typed links (fix commits, pull requests and patches first), OSV's fix commits and both sources' CWE identifiers; cve.now records keep their Exploit-DB, Metasploit, Nuclei and GitHub proof-of-concept entries. Only https links without credentials are kept, at most 40 links, 20 commits and 20 weaknesses per advisory. They are never sent to models and are not part of an advisory's revision. `explain` shows them per advisory.
+
+`security-watch shield-candidates [--all] [--unmitigated] [--omit-location] [--output NEW.json]` lists the findings worth a temporary mitigation, with a `readiness` from `fix_known` to `news_only` and what is still `missing`. `security-watch vex [--system ID] [--include-not-affected] [--omit-mitigations] [--author TEXT] [--output NEW.json]` writes an OpenVEX document. Both read the database and change nothing.
+
+An optional `mitigations` list (at most ten) shows how many hosts of an affected system a mitigation covers, read from JSON Lines files that your tools write:
+
+```yaml
+mitigations:
+  - format: shirudo # shirudo (Shirudo's node_vulns export) or generic
+    file: ./shirudo/node-vulns.jsonl # relative to this file
+    name: Shirudo # optional; default Shirudo or Mitigations; unique
+    max_age_minutes: 120 # 5 to 10080; an older file is a monitoring-health error
+    systems: {} # the file's system key -> system ID; an unmapped key is the system ID
+```
+
+The status is shown in alerts, digests, `explain`, `findings`, `shield-candidates` and `vex` as `mitigations`. Like EPSS it is shown only: it changes no applicability, priority, rule or decision, creates no revision and never closes a finding. Files are limited to 64 MiB and 500,000 rows. See [temporary mitigations](mitigations.md) for the generic format, and [Security Watch with Shirudo](shirudo.md) for the export query and `shirudo-sboms`.
+
 ## Model configuration
 
 Before enabling real delivery, [offline rehearsal](offline-rehearsal.md) can replay a bounded sequence of normalized evidence and optional inventory snapshots through the existing policy, queue and simulated delivery transports. It preserves configured channel selection while replacing destinations with in-process sinks, forces models/sources off, and verifies a temporary SQLite backup/restore. The command does not load credentials or open the configured database. Its private report omits raw identifiers, source text and destinations; it does not measure live coverage or model/analyst quality.
@@ -622,7 +641,7 @@ systems:
       LANGFLOW_WEBHOOK_AUTH_ENABLE: true
 ```
 
-`sbom` imports a local CycloneDX JSON 1.4, 1.5 or 1.6 file, or an SPDX JSON 2.2 or 2.3 file (including
+`sbom` imports a local CycloneDX JSON 1.2 to 1.7 file (a later 1.x is read by the 1.7 rules, with a notice), or an SPDX JSON 2.2 or 2.3 file (including
 GitHub's `{"sbom": ...}` API response). To have every SBOM in a folder become a system of its own, set
 `sbom_directory` at the top of the inventory instead; see [the SBOM folder](sbom.md#the-sbom-folder).
 `security-watch sbom` writes such a file from a project's lockfiles ([guide](sbom.md)). A component's
@@ -630,7 +649,17 @@ CycloneDX `evidence.occurrences` locations become its note (`found in package-lo
 20 MiB, 20,000 components and 32 nesting levels. Supported package URLs determine package
 identity and exact version; conflicting versions, duplicate references and invalid SHA-256
 hashes fail import. The same package listed twice without a reference of its own (nested under
-two parents) is imported once. SHA-256 component hashes and the input-file digest are retained.
+two parents) is imported once. One package release is one component of a system however often it is
+listed: an SBOM that lists it once per path (Syft does), or a system whose `components`, `libraries`,
+`sbom` and `lockfile` each name it, gives one component, one finding and one alert. Versions written
+two ways are one release (Python `2.0` and `2.0.0`, Go `v1.9.1` and `1.9.1`); different releases stay
+separate components. The listing kept is the one under `components`, then an SBOM entry, a `libraries`
+entry, a lockfile entry (the smallest component ID among equals). Its note lists every place the
+package was found, within 500 characters; it takes the others' dependency edges and remediation
+records, and the package URL, reference and verification results it lacks (not their digest or
+deployment observation, which would change a finding already reported). When the kept listing later
+disappears and another copy stays, or a generator renames the reference, the component keeps the ID
+it had at the previous scan, so its finding goes on without a new alert. SHA-256 component hashes and the input-file digest are retained.
 Original package URLs and component references are preserved. Dependency graphs are bounded
 to 20,000 source entries, 1,000 targets per entry and 100,000 total edges. The import report's
 `dependencies` and inventory system's `sbom_dependencies` retain `{ref, depends_on}` entries.

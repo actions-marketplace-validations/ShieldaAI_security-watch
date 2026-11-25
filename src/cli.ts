@@ -14,10 +14,26 @@ import {
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { stringify } from 'yaml';
+import { parse as parseYaml, stringify } from 'yaml';
 import { z } from 'zod';
 import { loadConfig, parseConfig, missingCredentials } from './config.js';
-import { loadInventory } from './inventory.js';
+import { keepComponentIds, loadInventory } from './inventory.js';
+import {
+  checkAdvisory,
+  checkChange,
+  checkPackages,
+  checkProject,
+  formatAdvisoryReport,
+  formatChangeReport,
+  formatCheckReport,
+  failsAt,
+  type CheckFinding,
+  type PackageQuery,
+} from './check.js';
+import { shieldCandidates } from './shield-candidates.js';
+import { openVex } from './vex.js';
+import { exportProblems, maxAges, readMitigationExport, withCurrentMitigations } from './mitigations.js';
+import { syncShirudoSboms } from './shirudo-sboms.js';
 import { importSbom } from './sbom.js';
 import { DEPENDENCY_FILES, generateSbom, type GeneratedSbom, type SbomOptions } from './manifests.js';
 import { intakeDirectory, startIntake } from './intake.js';
@@ -28,6 +44,12 @@ import { PilotReportError } from './pilot-report.js';
 import { runScan, readFixture, healthFinding } from './engine.js';
 import { deliverPending, slackProblem, smtpProblem } from './delivery.js';
 import { safeHttp, validateDestination } from './http.js';
+
+/** The inventory as it is now, with the component identifiers the last scan gave its findings. */
+function currentInventory(path: string, store: Store): Inventory {
+  const baseline = store.getMeta('inventory:baseline');
+  return keepComponentIds(loadInventory(path), baseline ? (JSON.parse(baseline) as Inventory) : undefined);
+}
 
 /** Whether the heartbeat would refuse this address. */
 function heartbeatProblem(address: string, allowPrivate: boolean | undefined): boolean {
@@ -41,7 +63,7 @@ function heartbeatProblem(address: string, allowPrivate: boolean | undefined): b
 import { acquireLock, unlockStoppedWorker } from './lock.js';
 import { decide } from './assessment.js';
 import { catchingUpFrom, checkHealth } from './health.js';
-import type { Assessment, Config } from './types.js';
+import type { Assessment, Config, Inventory, Severity } from './types.js';
 import { PROVIDERS, providerDefinition } from './providers.js';
 import { loadEnvFile, starterSystems, SYSTEM_TEMPLATES } from './setup.js';
 import { ECOSYSTEMS, parseLibraryList } from './ecosystems.js';
@@ -79,6 +101,13 @@ const VERSION = (
 ).version;
 const help = `Shielda Security Watch ${VERSION}
 
+  security-watch check [PROJECT] [--production] [--epss] [--fail-on high] [--json]
+  security-watch check [PROJECT] --base REF        (only what a change since REF brings in)
+  security-watch check --sbom FILE.json
+  security-watch check --package npm:lodash@4.17.21 [--package pypi:requests@2.31.0 ...]
+  security-watch check [PROJECT] --advisory CVE-2021-44906
+  security-watch mcp [PROJECT]                     (MCP server on stdio, for AI agents)
+
   security-watch sbom [--project PATH] [--output FILE.cdx.json] [--name NAME] [--system-id ID]
     [--owner TEXT] [--environment TEXT] [--note TEXT] [--exposure internet|internal|unknown]
     [--criticality low|medium|high|critical] [--production] [--source-url URL] [--source-revision REV]
@@ -101,6 +130,9 @@ const help = `Shielda Security Watch ${VERSION}
   security-watch rehearse --config PATH --input SCENARIO.json [--sink disabled|accepted|failed|unknown] [--output NEW.json]
   security-watch start [--config PATH]
   security-watch findings | status | deliveries | budget
+  security-watch shield-candidates [--all] [--unmitigated] [--omit-location] [--output NEW.json]
+  security-watch vex [--system ID] [--include-not-affected] [--omit-mitigations] [--author TEXT] [--output NEW.json]
+  security-watch shirudo-sboms --store DIR --directory SBOM_DIR [--running EXPORT.jsonl] [--config PATH] [--apply] [--allow-removals]
   security-watch pilot-report (--database PATH | --backup PATH) --from YYYY-MM-DD --until YYYY-MM-DD [--output NEW.json]
   security-watch pilot-recall --backup PATH --from YYYY-MM-DD --until YYYY-MM-DD --input INCIDENTS.json [--responses RESPONSES.json] [--output NEW.json]
   security-watch pilot-cases --backup PATH --from YYYY-MM-DD --until YYYY-MM-DD --output NEW.json
@@ -120,11 +152,23 @@ const help = `Shielda Security Watch ${VERSION}
   security-watch unlock             (only removes a stopped worker's lock)
   security-watch test-notification --channel slack|email
 
+check asks OSV about every package in a project now and marks CISA known-exploited entries; it
+sends package names and versions (and, with --epss, CVE IDs to FIRST), stores nothing and needs no
+configuration. Exit code 1: an installed version affected at or above --fail-on (high; malware and
+known-exploited always count, an advisory without a severity counts as medium, a package without an
+exact version never does; none never fails); 2: the check is incomplete (a source failed or a
+dependency file could not be read). --base REF... compares with the point where the branch left REF.
+
 sbom reads the lockfiles and manifests in a project (npm, Python, Go, Rust, PHP, Ruby, Java,
 .NET, Dart, Elixir, Swift, Haskell) and writes a CycloneDX SBOM. It runs nothing and sends nothing.
 init --project creates a monitor for that project in one step. With an intake section in the
 configuration, start also receives SBOMs from CI (sbom --upload, upload); intake runs only that.
 Upload tokens are read from SECURITY_WATCH_INTAKE_TOKEN unless --token-env names another variable.
+
+shield-candidates lists critical and exploited findings with what is known for writing a temporary
+runtime shield (fix links, versions, exploit code) and what is missing; vex writes OpenVEX for
+other scanners; both change nothing. shirudo-sboms copies Shirudo's image SBOMs into the SBOM
+folder, showing its plan unless --apply is given.
 
 Default config: ./security-watch.yaml. scan records findings; --dry-run writes no state,
 disables models and sends nothing. --notify sends due jobs. start runs the foreground scheduler and
@@ -195,6 +239,22 @@ function argumentsFromCommandLine() {
       url: { type: 'string' },
       'token-env': { type: 'string' },
       'allow-http': { type: 'boolean' },
+      'omit-location': { type: 'boolean' },
+      unmitigated: { type: 'boolean' },
+      'allow-removals': { type: 'boolean' },
+      'include-not-affected': { type: 'boolean' },
+      'omit-mitigations': { type: 'boolean' },
+      author: { type: 'string' },
+      system: { type: 'string' },
+      store: { type: 'string' },
+      running: { type: 'string' },
+      sbom: { type: 'string' },
+      base: { type: 'string' },
+      package: { type: 'string', multiple: true },
+      advisory: { type: 'string' },
+      epss: { type: 'boolean' },
+      'fail-on': { type: 'string' },
+      json: { type: 'boolean' },
     },
   });
 }
@@ -648,6 +708,75 @@ async function initialize(): Promise<void> {
     `Created ${configPath} and ${inventoryPath}. ${sbomFiles.length ? 'Each SBOM in sboms/ is one system; add owners and notes with security-watch sbom --owner/--note, or describe more systems in systems.yaml.' : 'Add installed versions and deployment details to systems.yaml.'} Copy .env.example to .env and fill in any required credentials. Then run:\n  security-watch doctor --config ${shellArgument(configPath)} --credentials-file ${shellArgument(resolve(directory, '.env'))}\n  security-watch scan --config ${shellArgument(configPath)} --credentials-file ${shellArgument(resolve(directory, '.env'))} --dry-run\nNo messages were sent.`,
   );
 }
+/** `ecosystem:name@version`, such as npm:lodash@4.17.21, npm:@scope/pkg@1.0.0 or maven:org.x:lib@2.1. */
+function packageArgument(value: string): PackageQuery {
+  const colon = value.indexOf(':');
+  if (colon < 1)
+    throw new Error(`--package ${value}: write it as ecosystem:name@version, such as npm:lodash@4.17.21.`);
+  const rest = value.slice(colon + 1).replace('==', '@');
+  const at = rest.lastIndexOf('@');
+  return at > 0
+    ? { ecosystem: value.slice(0, colon), name: rest.slice(0, at), version: rest.slice(at + 1) }
+    : { ecosystem: value.slice(0, colon), name: rest };
+}
+
+async function runCheck(): Promise<void> {
+  if ((values.project?.length ?? 0) + (id ? 1 : 0) > 1) throw new Error('check reads one project at a time.');
+  const project = id ?? values.project?.[0];
+  const failOn = values['fail-on'] ?? 'high';
+  if (!['critical', 'high', 'medium', 'low', 'none'].includes(failOn))
+    throw new Error('--fail-on must be critical, high, medium, low or none.');
+  if (values.package && (project || values.sbom || values.base || values.advisory))
+    throw new Error(
+      '--package checks the named packages only; leave out the project, --sbom, --base and --advisory.',
+    );
+  if (values.base && (values.sbom || values.advisory))
+    throw new Error(
+      '--base compares a project folder with git; it cannot be combined with --sbom or --advisory.',
+    );
+  if (values.sbom && project) throw new Error('Give a project or --sbom, not both.');
+  const common = {
+    ...(values.epss ? { epss: true } : {}),
+    ...(values.production ? { production: true } : {}),
+  };
+  const target = {
+    ...common,
+    ...(project ? { project } : {}),
+    ...(values.sbom ? { sbom: values.sbom } : {}),
+  };
+  let failing: CheckFinding[];
+  let degraded: boolean;
+  let result: unknown;
+  let text: string;
+  if (values.package) {
+    const report = await checkPackages(values.package.map(packageArgument), common);
+    [failing, degraded, result, text] = [report.findings, report.degraded, report, formatCheckReport(report)];
+  } else if (values.advisory) {
+    const report = await checkAdvisory(values.advisory, target);
+    [failing, degraded, result, text] = [
+      report.findings,
+      report.project.degraded,
+      report,
+      formatAdvisoryReport(report),
+    ];
+  } else if (values.base) {
+    const report = await checkChange({ ...target, base: values.base });
+    [failing, degraded, result, text] = [
+      report.added,
+      report.head.degraded,
+      report,
+      formatChangeReport(report),
+    ];
+  } else {
+    const report = await checkProject(target);
+    [failing, degraded, result, text] = [report.findings, report.degraded, report, formatCheckReport(report)];
+  }
+  if (values.json) output(result);
+  else console.log(text);
+  const fails = failing.some((finding) => failsAt(finding, failOn as Severity | 'none'));
+  process.exitCode = fails ? 1 : degraded ? 2 : 0;
+}
+
 async function main(): Promise<void> {
   if (values.version) {
     console.log(VERSION);
@@ -658,6 +787,8 @@ async function main(): Promise<void> {
     return;
   }
   const commandFlags: Record<string, string[]> = {
+    check: ['project', 'sbom', 'base', 'package', 'advisory', 'production', 'epss', 'fail-on', 'json'],
+    mcp: [],
     sbom: [
       'project',
       'output',
@@ -702,6 +833,7 @@ async function main(): Promise<void> {
     ecosystems: [],
     'normalize-libraries': ['input', 'ecosystem', 'output'],
     'import-sbom': ['input', 'output'],
+    'shirudo-sboms': ['store', 'directory', 'running', 'apply', 'allow-removals', 'config'],
     coverage: ['config'],
     'inventory-drift': ['config'],
     doctor: ['config', 'no-ai'],
@@ -715,6 +847,8 @@ async function main(): Promise<void> {
     'pilot-report': ['database', 'backup', 'from', 'until', 'output'],
     start: ['config', 'no-ai'],
     findings: ['config'],
+    'shield-candidates': ['config', 'all', 'omit-location', 'unmitigated', 'output'],
+    vex: ['config', 'system', 'include-not-affected', 'omit-mitigations', 'author', 'output'],
     status: ['config'],
     deliveries: ['config'],
     budget: ['config'],
@@ -736,8 +870,26 @@ async function main(): Promise<void> {
   if (!commandFlags[command]) throw new Error(`Unknown command ${command}. Use --help.`);
   for (const flag of Object.keys(values))
     if (!commandFlags[command]!.includes(flag)) throw new Error(`--${flag} is not supported by ${command}.`);
-  const needsId = ['explain', 'history', 'review', 'acknowledge', 'suppress', 'retry'].includes(command);
+  const needsId = [
+    'explain',
+    'history',
+    'review',
+    'acknowledge',
+    'suppress',
+    'retry',
+    'check',
+    'mcp',
+  ].includes(command);
   if (positionals.length > (needsId ? 2 : 1)) throw new Error('Unexpected positional arguments. Use --help.');
+  if (command === 'check') {
+    await runCheck();
+    return;
+  }
+  if (command === 'mcp') {
+    const { mcpMain } = await import('./mcp-server.js');
+    mcpMain(id ? [id] : []);
+    return;
+  }
   if (command === 'init') {
     await initialize();
     return;
@@ -764,6 +916,37 @@ async function main(): Promise<void> {
     const body = readFileSync(path);
     if (body.byteLength > 20 * 1024 * 1024) throw new Error('An SBOM may be at most 20 MiB.');
     await sendSbom(body, values['system-id'] ?? systemIdOf(body, path));
+    return;
+  }
+  if (command === 'shirudo-sboms') {
+    if (!values.store || !values.directory) throw new Error('--store DIR and --directory SBOM_DIR required');
+    // With --config, systems described by hand in the inventory are known, so an image with the same
+    // ID is reported instead of being refused by every scan.
+    let reserved: string[] = [];
+    if (values.config) {
+      const inventoryPath = loadConfig(resolve(values.config)).inventory;
+      const raw: unknown = parseYaml(readFileSync(inventoryPath, 'utf8'), { maxAliasCount: 0 });
+      const systems = raw && typeof raw === 'object' ? (raw as { systems?: unknown }).systems : undefined;
+      reserved = Array.isArray(systems)
+        ? systems
+            .map((system) =>
+              system && typeof system === 'object' ? (system as { id?: unknown }).id : undefined,
+            )
+            .filter((value): value is string => typeof value === 'string')
+        : [];
+    }
+    const plan = syncShirudoSboms({
+      reserved,
+      allowRemovals: Boolean(values['allow-removals']),
+      store: resolve(values.store),
+      output: resolve(values.directory),
+      ...(values.running ? { exposure: resolve(values.running) } : {}),
+      apply: Boolean(values.apply),
+    });
+    output(plan);
+    if (!values.apply && (plan.images.some((item) => item.action === 'write') || plan.remove.length))
+      console.error('Nothing was written. Run again with --apply to write this plan.');
+    if (plan.problems.length) process.exitCode = 2;
     return;
   }
   if (command === 'import-sbom') {
@@ -900,6 +1083,45 @@ async function main(): Promise<void> {
       ? process.env[config.notifications.slack.webhook_url_env]
       : undefined;
     const heartbeat = config.monitoring ? process.env[config.monitoring.heartbeat_url_env] : undefined;
+    // Each mitigation export is read as a scan reads it; what it covers is shown so a mapping
+    // mistake (an image ID that is no system ID) is seen before the first alert.
+    const systemIds = new Set(inventory.systems.map((system) => system.id));
+    const mitigationProblems: string[] = [];
+    const mitigations = (config.mitigations ?? []).map((source) => {
+      try {
+        const exported = readMitigationExport(source, Date.now());
+        mitigationProblems.push(...exportProblems(exported, source, Date.now()));
+        const keys = new Set(exported.rows.map((row) => row.system));
+        const systems = [...keys].map((key) =>
+          Object.hasOwn(source.systems, key) ? source.systems[key]! : key,
+        );
+        const unknown = systems.filter((id) => !systemIds.has(id));
+        if (unknown.length)
+          mitigationProblems.push(
+            `${source.name}: ${unknown.length} system key(s) in the export match no system in the inventory (${unknown
+              .slice(0, 5)
+              .join(', ')}${unknown.length > 5 ? ', …' : ''}); map them with systems: or add those systems.`,
+          );
+        return {
+          name: source.name,
+          format: source.format,
+          rows: exported.rows.length,
+          hosts: new Set(exported.rows.map((row) => `${row.system}\u0000${row.host}`)).size,
+          systems_matched: systems.filter((id) => systemIds.has(id)).length,
+          exported_at: exported.exported_at,
+          stale: exported.stale,
+        };
+      } catch (error) {
+        mitigationProblems.push(
+          `${source.name}: the export cannot be read: ${
+            (error as NodeJS.ErrnoException).code === 'ENOENT'
+              ? 'the file does not exist'
+              : (error as Error).message
+          }.`,
+        );
+        return { name: source.name, format: source.format, readable: false };
+      }
+    });
     const problems = [
       // Delivery refuses such an address on every attempt; say so before the first alert is due.
       ...(slack && slackProblem(slack)
@@ -913,6 +1135,7 @@ async function main(): Promise<void> {
           ]
         : []),
       ...intakeProblems(config),
+      ...mitigationProblems,
       // The heartbeat refuses such an address on every ping.
       ...(heartbeat && heartbeatProblem(heartbeat, config.monitoring!.allow_private_endpoint)
         ? [`${config.monitoring!.heartbeat_url_env}: the external heartbeat address cannot be used.`]
@@ -944,6 +1167,7 @@ async function main(): Promise<void> {
       feeds: config.sources.feeds.length + Number(config.sources.hacker_news),
       notification_routes: routes,
       notification_channels: enabledChannels,
+      ...(mitigations.length ? { mitigations } : {}),
       ecosystems: [
         ...new Set(
           inventory.systems.flatMap((system) => system.components.map((component) => component.ecosystem)),
@@ -1008,6 +1232,8 @@ async function main(): Promise<void> {
     'scan',
     'start',
     'findings',
+    'shield-candidates',
+    'vex',
     'status',
     'coverage',
     'inventory-drift',
@@ -1033,6 +1259,8 @@ async function main(): Promise<void> {
     (command === 'prune' && !values.apply) ||
     [
       'findings',
+      'shield-candidates',
+      'vex',
       'status',
       'coverage',
       'inventory-drift',
@@ -1130,7 +1358,97 @@ async function main(): Promise<void> {
       return;
     }
     if (command === 'findings') {
-      output(store.findings());
+      const ages = maxAges(config.mitigations);
+      output(store.findings().map((finding) => withCurrentMitigations(finding, ages, Date.now())));
+      return;
+    }
+    if (command === 'vex') {
+      const author = values.author ?? 'Security Watch';
+      if (
+        !author.trim() ||
+        author.length > 200 ||
+        /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/.test(author)
+      )
+        throw new Error('--author must be one line of at most 200 characters');
+      // The packages and their versions come from the inventory as it is now, with the component
+      // identifiers the last scan gave the findings.
+      const inventory = currentInventory(config.inventory, store);
+      if (values.system !== undefined && !inventory.systems.some((system) => system.id === values.system))
+        throw new Error(`No system ${values.system} in the inventory`);
+      const ages = maxAges(config.mitigations);
+      const { document, skipped } = openVex({
+        findings: store.findings().map((finding) => withCurrentMitigations(finding, ages, Date.now())),
+        evidence: (ids) => store.getEvidence(ids),
+        inventory,
+        ...(values.system !== undefined ? { systemId: values.system } : {}),
+        includeNotAffected: Boolean(values['include-not-affected']),
+        author: author.trim(),
+        // Fresh runtime mitigations are worth telling a consumer; they never change the status.
+        mitigationNote: (finding) => {
+          // Only a current status that covers at least one host is worth saying outside, with its time.
+          if (values['omit-mitigations']) return undefined;
+          const fresh = (finding.mitigations ?? []).filter(
+            (status) => !status.stale && !status.not_listed && (status.states.mitigated ?? 0) > 0,
+          );
+          return fresh.length
+            ? `Temporary runtime mitigation on ${fresh
+                .map(
+                  (status) =>
+                    `${status.states.mitigated} of ${status.hosts} host(s) (${status.source}, ${status.exported_at.slice(0, 16).replace('T', ' ')} UTC)`,
+                )
+                .join('; ')}.`
+            : undefined;
+        },
+      });
+      if (values.output) {
+        writeFileSync(resolve(values.output), JSON.stringify(document, null, 2) + '\n', {
+          flag: 'wx',
+          mode: 0o600,
+        });
+        const left = Object.entries(skipped)
+          .map(([reason, count]) => `${count} ${reason.replaceAll('_', ' ')}`)
+          .join(', ');
+        console.log(
+          `${document.statements.length} VEX statement(s) saved.${left ? ` Not written: ${left}.` : ''}`,
+        );
+      } else {
+        output(document);
+        const left = Object.entries(skipped)
+          .map(([reason, count]) => `${count} ${reason.replaceAll('_', ' ')}`)
+          .join(', ');
+        if (left) console.error(`Not written: ${left}.`);
+      }
+      return;
+    }
+    if (command === 'shield-candidates') {
+      // The inventory as it is now gives package versions; a stored location is the fallback.
+      let inventory;
+      try {
+        inventory = currentInventory(config.inventory, store);
+      } catch {
+        inventory = undefined;
+      }
+      const report = shieldCandidates({
+        findings: store.findings(),
+        evidence: (ids) => store.getEvidence(ids),
+        ...(inventory ? { inventory } : {}),
+        controls: (findingId) => store.controls(findingId),
+        all: Boolean(values.all),
+        omitLocation: Boolean(values['omit-location']),
+        unmitigatedOnly: Boolean(values.unmitigated),
+        mitigationMaxAge: maxAges(config.mitigations),
+      });
+      if (!inventory)
+        report.notes.push(
+          'The inventory could not be read: a package and its installed version are shown only where an advisory matched exactly one package by version.',
+        );
+      if (values.output) {
+        writeFileSync(resolve(values.output), JSON.stringify(report, null, 2) + '\n', {
+          flag: 'wx',
+          mode: 0o600,
+        });
+        console.log(`${report.candidates.length} shield candidate(s) saved.`);
+      } else output(report);
       return;
     }
     if (command === 'deliveries') {
@@ -1169,8 +1487,9 @@ async function main(): Promise<void> {
       return;
     }
     if (command === 'explain') {
-      const finding = id ? store.getFinding(id) : undefined;
-      if (!finding) throw new Error('Finding not found');
+      const saved = id ? store.getFinding(id) : undefined;
+      if (!saved) throw new Error('Finding not found');
+      const finding = withCurrentMitigations(saved, maxAges(config.mitigations), Date.now());
       output({
         finding,
         decision: decide(finding, config),
@@ -1183,6 +1502,10 @@ async function main(): Promise<void> {
           fetched_at: e.fetched_at,
           withdrawn: e.withdrawn ?? false,
           ...(e.cvss_v4 ? { cvss_v4: e.cvss_v4 } : {}),
+          ...(e.references ? { references: e.references } : {}),
+          ...(e.fix_commits ? { fix_commits: e.fix_commits } : {}),
+          ...(e.weaknesses ? { weaknesses: e.weaknesses } : {}),
+          ...(e.exploit_sources ? { exploit_sources: e.exploit_sources } : {}),
         })),
         note: 'Applicability reflects the cited evidence as last fetched. Inspect monitoring health for source outages.',
       });
@@ -1500,5 +1823,6 @@ main().catch((error) => {
   else if (error instanceof Error && /YAML/i.test(error.name))
     console.error('Invalid YAML; check configuration/inventory syntax.');
   else console.error(error instanceof Error ? error.message : 'Operation failed');
-  process.exitCode = 1;
+  // check uses 1 for "found something"; a check that could not run is 2, like an incomplete one.
+  process.exitCode = command === 'check' ? 2 : 1;
 });

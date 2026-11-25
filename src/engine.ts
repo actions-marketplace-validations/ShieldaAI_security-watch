@@ -4,11 +4,20 @@ import { cvssV4BaseScore } from './cvss4.js';
 import { assess, decide } from './assessment.js';
 import { collectSources } from './sources.js';
 import { attachEpss, findingCves, readEpssCache, refreshEpss } from './epss.js';
+import { evidenceContent } from './shield-inputs.js';
+import {
+  attachMitigations,
+  exportProblems,
+  MitigationIndex,
+  readMitigationExport,
+  unmatchedSystems,
+} from './mitigations.js';
 import { attachLocation, attachRemediation, compareInventories } from './inventory-evidence.js';
 import { ModelAnalyzer, PROMPT_VERSION } from './models.js';
 import { Store } from './store.js';
 import { safeHttp } from './http.js';
 import { missingCredentials } from './config.js';
+import { foldedInto, foldInventory, keepComponentIds } from './inventory.js';
 import { canonicalHash, hash, severityRank, timestamp } from './util.js';
 import type {
   Assessment,
@@ -91,6 +100,42 @@ export const evidenceSchema = z
     withdrawn: z.boolean().optional(),
     exploited: z.boolean().optional(),
     malware: z.boolean().optional(),
+    references: z
+      .array(
+        z.strictObject({
+          type: z.enum([
+            'fix',
+            'evidence',
+            'advisory',
+            'report',
+            'detection',
+            'introduced',
+            'package',
+            'source',
+            'web',
+          ]),
+          url: z.url({ protocol: /^https$/ }).max(2048),
+        }),
+      )
+      .max(40)
+      .optional(),
+    fix_commits: z
+      .array(
+        z.strictObject({
+          repo: z.url({ protocol: /^https$/ }).max(2048),
+          commit: z.string().regex(/^[0-9a-f]{7,64}$/),
+        }),
+      )
+      .max(20)
+      .optional(),
+    weaknesses: z
+      .array(z.string().regex(/^CWE-\d{1,5}$/))
+      .max(20)
+      .optional(),
+    exploit_sources: z
+      .array(z.enum(['exploit-db', 'metasploit', 'nuclei', 'github-poc']))
+      .max(4)
+      .optional(),
   })
   .strict();
 export function readFixture(path: string): Evidence[] {
@@ -173,7 +218,7 @@ export async function runScan(options: {
   onUrgent?: () => Promise<void>;
   signal?: AbortSignal;
 }): Promise<ScanReport> {
-  const { config, inventory, store, signal } = options;
+  const { config, store, signal } = options;
   checkCancellation(signal);
   const now = options.now ?? Date.now();
   const transport = options.http ?? safeHttp;
@@ -182,10 +227,11 @@ export async function runScan(options: {
     return transport(url, { ...request, ...(signal ? { signal } : {}) });
   };
   const priorInventory = store.getMeta('inventory:baseline');
-  const drift = compareInventories(
-    priorInventory ? (JSON.parse(priorInventory) as Inventory) : undefined,
-    inventory,
-  );
+  const previousInventory = priorInventory ? (JSON.parse(priorInventory) as Inventory) : undefined;
+  // A package release keeps the component identifier it had at the last scan, and so its findings.
+  // A snapshot or a caller's own inventory is folded too; one from loadInventory already is.
+  const inventory = keepComponentIds(foldInventory(options.inventory), previousInventory);
+  const drift = compareInventories(previousInventory, inventory);
   const previousById = new Map(store.findings().map((a) => [a.id, a]));
   // Events of findings still reported keep their identifier when a record gains an alias.
   const knownEvents = new Set(
@@ -202,11 +248,47 @@ export async function runScan(options: {
   // its revision and review: a score that changes daily must not re-send, reopen or re-analyse.
   let epssCache = config.sources.epss ? readEpssCache(store.getMeta('epss:cache')) : {};
   let epssEvidence = new Map(remediationEvidence.map((item) => [item.id, item]));
+  // Runtime mitigation status is read from the operator's export files and, like EPSS, is shown only.
+  const mitigationProblems: { source: string; message: string }[] = [];
+  const mitigationIndexes: MitigationIndex[] = [];
+  for (const source of config.mitigations ?? [])
+    try {
+      const exported = readMitigationExport(source, now);
+      mitigationIndexes.push(new MitigationIndex(exported, source));
+      const messages = exportProblems(exported, source, now);
+      // Rows that all miss the inventory are a mapping mistake (an image watched under another
+      // system ID, a typo in systems:), not a fleet without findings.
+      const missed = unmatchedSystems(
+        exported,
+        source,
+        new Set(inventory.systems.map((system) => system.id)),
+      );
+      if (exported.rows.length && missed.length === new Set(exported.rows.map((row) => row.system)).size)
+        messages.push(
+          `${source.name}: no system key in the export is a system in the inventory (${missed.slice(0, 5).join(', ')}${missed.length > 5 ? ', …' : ''}); map them with systems: or watch those systems.`,
+        );
+      for (const message of messages)
+        mitigationProblems.push({ source: `mitigations:${source.name}`, message });
+    } catch (error) {
+      mitigationProblems.push({
+        source: `mitigations:${source.name}`,
+        message: `${source.name}: the export could not be read, so its mitigation status is not shown: ${
+          (error as NodeJS.ErrnoException).code === 'ENOENT'
+            ? 'the file does not exist'
+            : (error as Error).message
+        }.`,
+      });
+    }
   const persist = (assessment: Assessment) => {
-    assessment = attachEpss(
-      attachLocation(attachRemediation(assessment, inventory, remediationEvidence, config, now), inventory),
-      epssCache,
-      findingCves(assessment, epssEvidence),
+    assessment = attachMitigations(
+      attachEpss(
+        attachLocation(attachRemediation(assessment, inventory, remediationEvidence, config, now), inventory),
+        epssCache,
+        findingCves(assessment, epssEvidence),
+      ),
+      mitigationIndexes,
+      epssEvidence,
+      inventory,
     );
     const decision = decide(assessment, config);
     decisions[assessment.id] = decision;
@@ -224,9 +306,15 @@ export async function runScan(options: {
         : undefined,
     );
   };
+  // A package listed twice in one system was two components before 1.4.1 and is one now. The
+  // finding of the listing that was folded is retired like any other, without an alert, and says
+  // where the package is still watched.
   const retire = (previous: Assessment) => {
-    // A retired finding is not looked up any more; an ageing score would only mislead.
-    const { epss: _epss, ...assessment } = previous;
+    // A retired finding is not looked up any more; an ageing score or shield status would only mislead.
+    const { epss: _epss, mitigations: _mitigations, ...assessment } = previous;
+    const kept = previous.component_id
+      ? foldedInto(previousInventory, inventory, previous.system_id, previous.component_id)
+      : undefined;
     store.saveAssessment(
       {
         ...assessment,
@@ -234,7 +322,9 @@ export async function runScan(options: {
         updated_at: timestamp(now),
         reasons: [
           ...assessment.reasons,
-          'No longer in the current assessment. This does not establish remediation.',
+          kept
+            ? `The same package and version is listed more than once in this system; it is watched as ${kept}, which keeps its own finding. This does not establish remediation.`
+            : 'No longer in the current assessment. This does not establish remediation.',
         ],
       },
       {
@@ -273,7 +363,8 @@ export async function runScan(options: {
       evidence: finding.evidence_ids.map((id) => {
         const item = evidenceById.get(id);
         if (!item) return null;
-        const { fetched_at: _fetched, ...content } = item;
+        // Shield inputs (links, commits, weaknesses) are never analysed, so they never ask for analysis.
+        const content = evidenceContent(item);
         const fetched = Date.parse(item.fetched_at);
         return {
           ...content,
@@ -374,6 +465,7 @@ export async function runScan(options: {
     ...result.errors,
     ...(inventory.import_warnings ?? []).map((message) => ({ source: 'inventory:sbom', message })),
   ];
+  errors.push(...mitigationProblems);
   const notices: string[] = [...(inventory.name_notices ?? [])];
   if (!options.fixture && missingCredentials(config).length)
     errors.push({

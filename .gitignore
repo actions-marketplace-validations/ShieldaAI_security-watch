@@ -4,6 +4,8 @@ coverage/
 data/
 *.db*
 *.tgz
+# Written for packing only (scripts/shrinkwrap.mjs).
+npm-shrinkwrap.json
 .env
 .env.*
 !.env.example
@@ -13,3 +15,7 @@ systems.yaml
 .intake-ci/
 sbom.cdx.json
 security-watch.cdx.json
+!test/fixtures/watch-1.2.1.db
+!test/fixtures/watch-1.4.0-duplicates.db
+# Plugin archives for directories that take a ZIP (npm run pack:plugins).
+artifacts/
